@@ -1,0 +1,400 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 1. Import all packages"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import numpy as np; from gprMax.utilities import detect_check_gpus; \n",
+    "from gprMax.gprMax import api; \n",
+    "import h5py; \n",
+    "import matplotlib.pyplot as plt; \n",
+    "import math\n",
+    "detect_check_gpus([1]);\n",
+    "import os; \n",
+    "import torch\n",
+    "import time; \n",
+    "from IPython.display import clear_output; \n",
+    "os.getcwd(); \n",
+    "from GPUtil import showUtilization as gpu_usage\n",
+    "from numba import cuda; \n",
+    "import gc; \n",
+    "import pycuda.driver; \n",
+    "import random; \n",
+    "import pandas as pd; \n",
+    "from scipy.signal import hilbert\n",
+    "from bayes_opt import BayesianOptimization; \n",
+    "import plotly.graph_objects as go; \n",
+    "import pickle"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "| ID | GPU | MEM |\n",
+      "------------------\n",
+      "|  0 | 18% |  0% |\n",
+      "|  1 | 46% |  2% |\n",
+      "| ID | GPU | MEM |\n",
+      "------------------\n",
+      "|  0 | 56% |  1% |\n",
+      "|  1 |  6% |  2% |\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Function to clean GPU cache after gprMax and MCMC simulations\n",
+    "def free_gpu_cache():\n",
+    "    gc.collect(); torch.cuda.empty_cache(); cuda.select_device(1); cuda.close(); cuda.select_device(1); gpu_usage()\n",
+    "    gc.collect(); torch.cuda.empty_cache(); cuda.select_device(0); cuda.close(); cuda.select_device(0); gpu_usage()\n",
+    "free_gpu_cache()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 2. Load Raw experimental data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Estimating perm, cond, and depth\n",
+    "data = pd.read_csv('ExpRawData.csv')\n",
+    "exp = data.iloc[1:19].mean()[2:-1];  \n",
+    "exp = exp - np.mean(exp)\n",
+    "tw=7.96e-9; \n",
+    "df = 1/tw; \n",
+    "fd = (exp.shape[0]-1)*df;    \n",
+    "dt = 1/fd; \n",
+    "t = np.arange(0,tw+dt,dt);  \n",
+    "\n",
+    "# Plot experimental data\n",
+    "plt.figure(figsize=(8, 3));\n",
+    "plt.plot(t,exp);\n",
+    "plt.xlabel('Time (s)'); \n",
+    "plt.ylabel('Amplitude');"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 3. Code for FDTD simulation in gprMax"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#Simulation\n",
+    "tw=tw;     # Time window for FDTD simulation (time till which GPR receives signal)\n",
+    "pec_Y = 0.04;   # Depth of the perfect electrical conductor\n",
+    "\n",
+    "def model_2L(p1, c1, p2, c2, sd2):\n",
+    "    sd1=0.15;   # Depth of the soil layer\n",
+    "    gpr_Y = pec_Y + sd1 + sd2;\n",
+    "    \n",
+    "    with open(\"Simulation.in\", \"w\") as f:\n",
+    "        f.write(\"#title: 15 cm soil + PEC + top layer of depth d2\")\n",
+    "        f.write(\"\\n#domain: 0.30 0.50 0.001\")\n",
+    "        f.write(\"\\n#dx_dy_dz: 0.001 0.001 0.001\")  \n",
+    "        f.write(\"\\n#time_window: {}\".format(tw))\n",
+    "        f.write(\"\\n#material: {} {} 1 0 mat1 \\n#material: {} {} 1 0 mat2\".format(p1, c1, p2, c2))\n",
+    "        f.write(\"\\n#waveform: gaussian 1 {} my_wave\".format(1.5778e9))\n",
+    "        f.write(\"\\n#hertzian_dipole: z 0.12 {} 0 my_wave\\n#rx: 0.18 {} 0\".format(gpr_Y, gpr_Y))\n",
+    "        f.write(\"\\n#box: 0 {} 0 0.3 {} 0.001 mat1\".format(pec_Y, pec_Y + sd1))\n",
+    "        f.write(\"\\n#box: 0 {} 0 0.3 {} 0.001 mat2\".format(pec_Y+sd1, pec_Y+sd1+sd2))\n",
+    "        f.write(\"\\n#box: 0 {} 0 0.30 {} 0.001 pec\".format(pec_Y-0.005, pec_Y))\n",
+    "        f.write(\"\\n#geometry_view: 0 0 0  0.30 0.50 0.001  0.001 0.001 0.001 Sim n\\n\")\n",
+    "        f.close()     \n",
+    "        \n",
+    "    api(\"Simulation.in\", geometry_only=False, gpu=[0]);    \n",
+    "    hf2 = h5py.File(\"Simulation.out\",'r', libver='latest', swmr=True)\n",
+    "    Ascan = hf2['rxs/rx1/Ez'][:];  \n",
+    "    hf2.close();    \n",
+    "    free_gpu_cache();    \n",
+    "    clear_output();    \n",
+    "    print('Parameters:', p1, c1, p2, c2, sd2)\n",
+    "    return Ascan\n",
+    "\n",
+    "\n",
+    "## Running an example simulation\n",
+    "sim = model_2L(p1=14, c1=0, p2=3, c2=0, sd2= 0.05) "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 4. Making experimental and numerical signal the same size"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Changing shape of the experimental signal\n",
+    "original_vector = -exp\n",
+    "new_size = sim.shape[0]  # Specify the desired new size\n",
+    "original_indices = np.arange(original_vector.size) # Create an array of indices for the original vector\n",
+    "new_indices = np.linspace(0, original_indices.max(), new_size) # Create an array of indices for the new vector\n",
+    "E_new = np.interp(new_indices, original_indices, original_vector) # Perform linear interpolation\n",
+    "\n",
+    "E_new_normalized = E_new/(np.max(abs(E_new)));          # Normalize the experimental signals   \n",
+    "sim_normalized = sim/(np.max(abs(sim)))                 # Normalize the simulational signals   \n",
+    "\n",
+    "E_new_normalized = np.abs(hilbert(E_new_normalized));   # Hilbert transform of experimental signal\n",
+    "sim_normalized = np.abs(hilbert(sim_normalized))        # Hilbert transform of simulational signal\n",
+    "\n",
+    "\n",
+    "# Plot comparison of experimental and numerical signal with RANDOM incorrect parameter values\n",
+    "df = 1/tw; \n",
+    "fd = (E_new_normalized.shape[0]-1)*df;    \n",
+    "dt = 1/fd;  \n",
+    "t = np.arange(0,tw+dt,dt);  \n",
+    "t = t*1e9; \n",
+    "\n",
+    "plt.figure(figsize=(10, 2))\n",
+    "plt.plot(t,E_new_normalized,color='red',label='GSSI_miniXT', linestyle='--'); \n",
+    "plt.plot(t,sim_normalized,color='blue',label='gprMax', linestyle='--'); \n",
+    "plt.xlabel('Time (ns)'); \n",
+    "plt.ylabel('Amplitude'); \n",
+    "plt.legend(); \n",
+    "plt.show();\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 5. Bayesian Optimization"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from bayes_opt import BayesianOptimization\n",
+    "\n",
+    "#-- Error Function:\n",
+    "def mae_func(p1, c1, p2, c2, sd2):\n",
+    "    vector1 = E_new_normalized;    \n",
+    "    vector2 = model_2L(p1, c1, p2, c2, sd2)\n",
+    "    vector2 = np.abs(hilbert(vector2/(np.max(abs(vector2)))))\n",
+    "    rel_error = -100*np.sqrt(np.sum((vector1 - vector2)**2))/(np.sqrt(np.sum(vector1**2))) # Relative error (objective function)\n",
+    "    return rel_error\n",
+    "\n",
+    "#-- Setting upper and lower bounds of each parameter:\n",
+    "bounds = {'p1':(1,23), \n",
+    "          'c1':(0,0.15), \n",
+    "          'p2':(1,15), \n",
+    "          'c2':(0,0.03), \n",
+    "          'sd2':(0.02,0.2)};     \n",
+    "\n",
+    "#-- Initializing Bayesian Optimization:\n",
+    "optimizer = BayesianOptimization(f=mae_func, \n",
+    "                                 pbounds=bounds, \n",
+    "                                 random_state=42)\n",
+    "\n",
+    "#-- Running Bayesian Optimization with initial points and iterations:\n",
+    "optimizer.maximize(init_points=550, n_iter=200)\n",
+    "\n",
+    "#-- Printing completion message and the best parameters found:\n",
+    "print(\"Optimization completed successfully.\");\n",
+    "print(optimizer.max)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 6. Bayesian Inference using MCMC"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import emcee\n",
+    "\n",
+    "t_total=[]; \n",
+    "t0 = time.time()\n",
+    "\n",
+    "\n",
+    "# Setting bounds for parameter space\n",
+    "bounds = {'p1': (1,23), 'c1': (0,0.1), 'p2': (1,9), 'c2': (0,0.1),  'sd2': (0.02, 0.18)}\n",
+    "\n",
+    "\n",
+    "# Likelihood function\n",
+    "def mae_func(p1, c1, p2, c2, sd2):\n",
+    "    vector1 = E_new_normalized                  # Experimental signal (normalized amplitude envelope)\n",
+    "    vector2 = model_2L(p1, c1, p2, c2, sd2)     # Run gprMax Simulation\n",
+    "    vector2 = vector2/(np.max(abs(vector2)))    # Normalizing simulation signal\n",
+    "    vector2 = np.abs(hilbert(vector2))          # Simulation signal (normalized amplitude envelope)\n",
+    "    \n",
+    "    error = vector1-vector2     # compute error\n",
+    "    sigma = np.std(error)       # compute the standard deviation of the residual\n",
+    "    result = np.sum(0.5*(error/sigma)**2 + np.log(np.sqrt(2*3.1416)*sigma)) #calculate the log likelihood\n",
+    "    \n",
+    "    return -result # We want to maximize the negative log likelihood\n",
+    "\n",
+    "\n",
+    "\n",
+    "# Define the log-posterior distribution function\n",
+    "def log_posterior(params):\n",
+    "    p1, c1, p2, c2, sd2 = params\n",
+    "    \n",
+    "    # Check if parameters are within bounds\n",
+    "    if (p1 < 1 or p1 > 23 or c1 < 0 or c1 > 0.1 or p2 < 1 or p2 > 9 or c2 < 0 or c2 > 0.1 or sd2 <0.02 or sd2 > 0.18):\n",
+    "        return -np.inf # Return -inf if the parameters are outside the bounds\n",
+    "    else:\n",
+    "        # Evaluate the log-posterior distribution as the negative of the objective function\n",
+    "        log_likelihood = mae_func(p1, c1, p2, c2, sd2)\n",
+    "        return log_likelihood       # No prior added as unifrom prior is assumed\n",
+    "    \n",
+    "\n",
+    "# Set the number of walkers and the number of steps for the MCMC sampler\n",
+    "nwalkers = 20\n",
+    "nsteps = 160\n",
+    "\n",
+    "\n",
+    "# Set the initial positions of the walkers by sampling from the prior distribution\n",
+    "p0 = np.random.uniform(low =[bounds['p1'][0], bounds['c1'][0], bounds['p2'][0], bounds['c2'][0], bounds['sd2'][0]], \n",
+    "                       high=[bounds['p1'][1], bounds['c1'][1], bounds['p2'][1], bounds['c2'][1], bounds['sd2'][1]], \n",
+    "                       size=(nwalkers, 5))\n",
+    "\n",
+    "\n",
+    "# Initialize the MCMC sampler, Run the sampler and get the posterior samples\n",
+    "sampler = emcee.EnsembleSampler(nwalkers, 5, log_posterior) # Initialize the MCMC sampler\n",
+    "pos, prob, state = sampler.run_mcmc(p0, nsteps)             # Run the MCMC sampler\n",
+    "samples = sampler.flatchain                                 # Get the posterior samples\n",
+    "\n",
+    "\n",
+    "# Calculate the end time and print the time needed to complete\n",
+    "t1 = time.time(); \n",
+    "t_total.append(t1 - t0); \n",
+    "print('Time (hrs)=', np.array(t_total)/3600)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6a. Plot the posterior distributions of the parameters\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import corner\n",
+    "flat_chain = sampler.get_chain(flat=True) # Get the flat chain with shape (nwalkers * nsteps, ndim)\n",
+    "label_props = {'fontsize': 16}\n",
+    "\n",
+    "fig = corner.corner(flat_chain, \n",
+    "                    quantiles=[0.5], \n",
+    "                    labels=[r\"Permittivity, $\\varepsilon_1$\", r\"Conductivity, $σ_1$\", r\"Permittivity, $\\varepsilon_2$\", r\"Conductivity, $σ_2$\", r\"Depth, $d_2$\"], \n",
+    "                    color='b', show_titles=True, title_fmt='.3f', label_kwargs=label_props)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 7. Compare experimental and numerical signal with predicted parameters"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Run simulation with predicted parameter values\n",
+    "sim = model_2L(p1=4.1, c1=.03, p2=3.47, c2=.014, sd2= 0.109)\n",
+    "\n",
+    "# Changing shape of the experimental signal\n",
+    "original_vector = -exp\n",
+    "new_size = sim.shape[0]  # Specify the desired new size\n",
+    "original_indices = np.arange(original_vector.size) # Create an array of indices for the original vector\n",
+    "new_indices = np.linspace(0, original_indices.max(), new_size) # Create an array of indices for the new vector\n",
+    "E_new = np.interp(new_indices, original_indices, original_vector) # Perform linear interpolation\n",
+    "\n",
+    "E_new_normalized = E_new/(np.max(abs(E_new)));          # Normalize the experimental signals   \n",
+    "sim_normalized = sim/(np.max(abs(sim)))                 # Normalize the simulational signals   \n",
+    "\n",
+    "E_new_normalized = np.abs(hilbert(E_new_normalized));   # Hilbert transform of experimental signal\n",
+    "sim_normalized = np.abs(hilbert(sim_normalized))        # Hilbert transform of simulational signal\n",
+    "\n",
+    "\n",
+    "# Plot the two results\n",
+    "df = 1/tw; \n",
+    "fd = (E_new_normalized.shape[0]-1)*df;    \n",
+    "dt = 1/fd;  \n",
+    "t = np.arange(0,tw+dt,dt);  \n",
+    "t = t*1e9; \n",
+    "\n",
+    "plt.figure(figsize=(10, 4))\n",
+    "plt.plot(t,E_new_normalized,color='red',label='GSSI_miniXT', linestyle='--'); \n",
+    "plt.plot(t,sim_normalized,color='blue',label='gprMax', linestyle='--'); \n",
+    "plt.xlabel('Time (ns)'); \n",
+    "plt.ylabel('Amplitude'); \n",
+    "plt.title('Matching response with predicted parameters')\n",
+    "plt.legend(); \n",
+    "plt.show();\n",
+    "\n",
+    "100*np.sqrt(np.sum((E_new_normalized - sim_normalized)**2))/(np.sqrt(np.sum(E_new_normalized**2)))\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "gprMax",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.4"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
